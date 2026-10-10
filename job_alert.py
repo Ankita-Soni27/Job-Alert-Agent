@@ -10,7 +10,7 @@ SEARCH_TEXT = os.environ.get("JOB_ROLE") or DEFAULT_ROLES  # read from GitHub se
 ROLES = [role.strip() for role in SEARCH_TEXT.split(",") if role.strip()]  # separate roles with commas
 MAX_DAYS_OLD = 3          # only jobs posted in the last 3 days
 JOBS_PER_ROLE = 25        # how many jobs to fetch for each role
-MAX_HR_LOOKUPS = 20       # how many companies to look up HR for each day (saves your free Serper searches)
+MAX_HR_LOOKUPS = 10       # how many companies to look up HR for each day (saves your free Serper searches)
 
 # --- Secrets (GitHub gives these to the script, they are not written here) ---
 ADZUNA_APP_ID = os.environ["ADZUNA_APP_ID"]
@@ -84,6 +84,7 @@ def add_hr_contacts(jobs):
 
     for job in jobs:
         company = job.get("company", {}).get("display_name")
+        job["hr_searched"] = company in contacts
         job["hr_contact"] = contacts.get(company)
     return jobs
 
@@ -106,8 +107,10 @@ def build_email_text(jobs):
         if hr:
             lines.append(f"   Possible HR contact: {hr['name']}")
             lines.append(f"   {hr['link']}")
-        else:
+        elif job.get("hr_searched"):
             lines.append("   Possible HR contact: not found")
+        else:
+            lines.append("   Possible HR contact: not searched today")
         lines.append(f"   Apply here: {link}")
         lines.append("")
     lines.append("Note: HR contacts come from a Google search and may be wrong. "
