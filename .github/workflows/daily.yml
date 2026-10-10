@@ -1,0 +1,30 @@
+name: Daily Job Alert
+
+on:
+  schedule:
+    - cron: "30 2 * * *"   # 2:30 AM UTC = 8:00 AM India time
+  workflow_dispatch:        # adds a "Run workflow" button so you can test it anytime
+
+jobs:
+  send-job-list:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install requests
+        run: pip install requests
+
+      - name: Run the job alert
+        env:
+          ADZUNA_APP_ID: ${{ secrets.ADZUNA_APP_ID }}
+          ADZUNA_APP_KEY: ${{ secrets.ADZUNA_APP_KEY }}
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          JOB_ROLE: ${{ vars.JOB_ROLE }}
+        run: python job_alert.py
