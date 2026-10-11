@@ -1,7 +1,9 @@
 import json
 import os
+import re
 import smtplib
 from email.message import EmailMessage
+from urllib.parse import quote
 
 import requests
 
@@ -78,25 +80,51 @@ def pick_new_companies(jobs, seen):
     return dict(list(companies.items())[:COMPANIES_PER_DAY])
 
 
+HR_WORDS = ["hr", "human resources", "recruit", "talent", "hiring", "people"]
+COMPANY_SUFFIXES = ["private limited", "pvt ltd", "pvt. ltd.", "limited", "ltd", "llp", "inc", "india", "technologies", "solutions"]
+
+
+def short_company_name(company):
+    """Cut a company name down to its main part, e.g. 'Infosys Limited' -> 'infosys'."""
+    name = company.lower()
+    for suffix in COMPANY_SUFFIXES:
+        name = name.replace(suffix, " ")
+    name = re.sub(r"[^a-z0-9 ]", " ", name)
+    return " ".join(name.split())
+
+
 def find_hr_contact(company):
-    """Google 'company HR recruiter LinkedIn' through Serper and return the first profile found."""
+    """Google for an HR profile and keep it ONLY if the company name and an HR word both appear in it."""
     if not SERPER_API_KEY:
         return None
+    core_name = short_company_name(company) or company.lower()
     try:
         response = requests.post(
             "https://google.serper.dev/search",
             headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
-            json={"q": f"{company} HR recruiter talent acquisition site:linkedin.com/in", "num": 5},
+            json={"q": f'"{company}" HR recruiter talent acquisition site:linkedin.com/in', "num": 10},
             timeout=30,
         )
         response.raise_for_status()
         for result in response.json().get("organic", []):
             link = result.get("link", "")
-            if "linkedin.com/in/" in link:
+            if "linkedin.com/in/" not in link:
+                continue
+            text = f"{result.get('title', '')} {result.get('snippet', '')}".lower()
+            text = re.sub(r"[^a-z0-9 ]", " ", text)
+            text = " ".join(text.split())
+            has_company = core_name in text
+            has_hr_word = any(word in text for word in HR_WORDS)
+            if has_company and has_hr_word:
                 return {"name": result.get("title", "LinkedIn profile"), "link": link}
     except Exception as error:
         print(f"HR search failed for {company}: {error}")
     return None
+
+
+def linkedin_search_link(company):
+    """A LinkedIn people-search link the person can click to see current HR staff of the company."""
+    return "https://www.linkedin.com/search/results/people/?keywords=" + quote(f"{company} HR recruiter")
 
 
 def build_email_text(companies):
@@ -117,6 +145,7 @@ def build_email_text(companies):
             lines.append(f"   {hr['link']}")
         else:
             lines.append("   Possible HR contact: not found")
+        lines.append(f"   Find HR on LinkedIn: {linkedin_search_link(company)}")
         lines.append(f"   Apply here: {first.get('redirect_url', 'No link')}")
         for other in company_jobs[1:3]:  # up to 2 more openings at the same company
             lines.append(f"   Also hiring: {other.get('title', 'No title')} - {other.get('redirect_url', '')}")
