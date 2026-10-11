@@ -3,7 +3,7 @@ import os
 import re
 import smtplib
 from email.message import EmailMessage
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import requests
 
@@ -14,6 +14,7 @@ ROLES = [role.strip() for role in SEARCH_TEXT.split(",") if role.strip()]  # sep
 MAX_DAYS_OLD = 3           # only jobs posted in the last 3 days
 JOBS_PER_ROLE = 50         # how many jobs to fetch for each role
 COMPANIES_PER_DAY = 30     # how many NEW companies to send each day
+COMPANY_CHECKS_PER_DAY = 3 # TRIAL: only check if the company looks genuine for this many companies (1 Serper search each). Raise later, e.g. to 30
 HR_LOOKUPS_PER_DAY = 3     # TRIAL: only search HR for this many companies (each uses 1 Serper search). Raise later, e.g. to 30
 SEEN_FILE = "seen_companies.json"   # remembers companies already sent, so they don't repeat
 
@@ -123,6 +124,79 @@ def find_hr_contact(company):
     return None
 
 
+NOT_A_COMPANY_WEBSITE = [
+    "linkedin.", "facebook.", "instagram.", "twitter.", "x.com", "youtube.", "wikipedia.", "quora.", "reddit.",
+    "ambitionbox.", "glassdoor.", "indeed.", "naukri.", "justdial.", "zaubacorp.", "tofler.", "crunchbase.",
+    "adzuna.", "instahyre.", "foundit.", "shine.", "monster.", "sulekha.", "indiamart.", "mca.gov.in",
+]
+
+
+def check_company(company):
+    """One Serper search to see if the company has a website, LinkedIn page, reviews and registration info."""
+    if not SERPER_API_KEY:
+        return None
+    core_name = short_company_name(company) or company.lower()
+    squashed = core_name.replace(" ", "")
+    try:
+        response = requests.post(
+            "https://google.serper.dev/search",
+            headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
+            json={"q": f"{company} company India", "num": 10},
+            timeout=30,
+        )
+        response.raise_for_status()
+        results = response.json().get("organic", [])
+    except Exception as error:
+        print(f"Company check failed for {company}: {error}")
+        return None
+
+    def matches(result):
+        link = result.get("link", "").lower()
+        text = f"{result.get('title', '')} {link}".lower()
+        text = " ".join(re.sub(r"[^a-z0-9 ]", " ", text).split())
+        return core_name in text or squashed in link.replace("-", "").replace(".", "")
+
+    found = {"website": None, "linkedin": None, "reviews": None, "registration": None}
+    for result in results:
+        link = result.get("link", "")
+        low = link.lower()
+        if not matches(result):
+            continue
+        if "linkedin.com/company/" in low and not found["linkedin"]:
+            found["linkedin"] = link
+        elif ("ambitionbox." in low or "glassdoor." in low) and not found["reviews"]:
+            found["reviews"] = link
+        elif ("zaubacorp." in low or "tofler." in low) and not found["registration"]:
+            found["registration"] = link
+        elif not any(bad in low for bad in NOT_A_COMPANY_WEBSITE) and not found["website"]:
+            found["website"] = link
+    return found
+
+
+def company_check_lines(company, checked):
+    """Turn the company check into short email lines."""
+    if not checked:
+        return ["   Company check: not checked today"]
+    found = check_company(company)
+    if found is None:
+        return ["   Company check: could not check (search failed)"]
+
+    score = sum(1 for value in found.values() if value)
+    if score >= 3:
+        verdict = "Looks established"
+    elif score == 2:
+        verdict = "Limited info - check carefully"
+    else:
+        verdict = "WARNING - very little info found, be careful"
+
+    labels = [("website", "Website"), ("linkedin", "LinkedIn page"),
+              ("reviews", "Reviews"), ("registration", "Registration info")]
+    lines = [f"   Company check: {score}/4 signals - {verdict}"]
+    for key, label in labels:
+        lines.append(f"     {label}: {found[key] or 'not found'}")
+    return lines
+
+
 def linkedin_search_link(company):
     """A LinkedIn people-search link the person can click to see current HR staff of the company."""
     return "https://www.linkedin.com/search/results/people/?keywords=" + quote(f"{company} HR recruiter")
@@ -150,12 +224,14 @@ def build_email_text(companies):
         else:
             lines.append("   Possible HR contact: not searched today")
         lines.append(f"   Find HR on LinkedIn: {linkedin_search_link(company)}")
+        lines.extend(company_check_lines(company, number <= COMPANY_CHECKS_PER_DAY))
         lines.append(f"   Apply here: {first.get('redirect_url', 'No link')}")
         for other in company_jobs[1:3]:  # up to 2 more openings at the same company
             lines.append(f"   Also hiring: {other.get('title', 'No title')} - {other.get('redirect_url', '')}")
         lines.append("")
     lines.append("Note: HR contacts come from a Google search and may be wrong. "
-                 "Check the profile before messaging anyone.")
+                 "Check the profile before messaging anyone. "
+                 "The company check is only a guide, not proof that a company is genuine.")
     return "\n".join(lines)
 
 
