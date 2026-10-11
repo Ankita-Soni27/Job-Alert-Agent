@@ -13,7 +13,8 @@ SEARCH_TEXT = os.environ.get("JOB_ROLE") or DEFAULT_ROLES  # read from GitHub se
 ROLES = [role.strip() for role in SEARCH_TEXT.split(",") if role.strip()]  # separate roles with commas
 MAX_DAYS_OLD = 3           # only jobs posted in the last 3 days
 JOBS_PER_ROLE = 50         # how many jobs to fetch for each role
-COMPANIES_PER_DAY = 30     # how many NEW companies to send each day (each one uses 1 Serper search)
+COMPANIES_PER_DAY = 30     # how many NEW companies to send each day
+HR_LOOKUPS_PER_DAY = 3     # TRIAL: only search HR for this many companies (each uses 1 Serper search). Raise later, e.g. to 30
 SEEN_FILE = "seen_companies.json"   # remembers companies already sent, so they don't repeat
 
 # --- Secrets (GitHub gives these to the script, they are not written here) ---
@@ -136,15 +137,18 @@ def build_email_text(companies):
     lines = [f"{len(companies)} new companies today for: {roles_text}", ""]
     for number, (company, company_jobs) in enumerate(companies.items(), start=1):
         first = company_jobs[0]
-        hr = find_hr_contact(company)
+        searched = number <= HR_LOOKUPS_PER_DAY
+        hr = find_hr_contact(company) if searched else None
 
         lines.append(f"{number}. {company}")
         lines.append(f"   Job: {first.get('title', 'No title')}")
         if hr:
             lines.append(f"   Possible HR contact: {hr['name']}")
             lines.append(f"   {hr['link']}")
-        else:
+        elif searched:
             lines.append("   Possible HR contact: not found")
+        else:
+            lines.append("   Possible HR contact: not searched today")
         lines.append(f"   Find HR on LinkedIn: {linkedin_search_link(company)}")
         lines.append(f"   Apply here: {first.get('redirect_url', 'No link')}")
         for other in company_jobs[1:3]:  # up to 2 more openings at the same company
