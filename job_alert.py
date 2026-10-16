@@ -2,6 +2,8 @@ import json
 import os
 import re
 import smtplib
+import time
+from datetime import date
 from email.message import EmailMessage
 from itertools import zip_longest
 
@@ -11,9 +13,18 @@ import requests
 DEFAULT_ROLES = "associate data analyst, associate business analyst, data analyst, business analyst"
 SEARCH_TEXT = os.environ.get("JOB_ROLE") or DEFAULT_ROLES  # read from GitHub setting JOB_ROLE
 ROLES = [role.strip() for role in SEARCH_TEXT.split(",") if role.strip()]  # separate roles with commas
+# City name used for searching -> words that count as a match in a job's location
+CITIES = {
+    "Delhi": ["delhi"],
+    "Noida": ["noida"],
+    "Gurgaon": ["gurgaon", "gurugram"],
+    "Bangalore": ["bangalore", "bengaluru", "bangaluru"],
+    "Hyderabad": ["hyderabad", "secunderabad"],
+}
+JSEARCH_REQUESTS_PER_RUN = 4   # JSearch free plan = 200 requests a month, so we rotate through cities day by day
 MAX_DAYS_OLD = 3           # only jobs posted in the last 3 days
 MAX_EXPERIENCE_YEARS = 3   # skip jobs that ask for more than this many years of experience
-FETCH_PER_ROLE = 50        # how many jobs to ask Adzuna for, for each role
+FETCH_PER_SEARCH = 50      # how many jobs to ask Adzuna for, for each role + city search
 JOBS_PER_DAY = 15          # how many NEW jobs to email each day
 ADZUNA_SHARE = 0.5         # half of the jobs from Adzuna, the other half from JSearch
 DESCRIPTION_LENGTH = 350   # how many characters of the job description to show
@@ -45,17 +56,35 @@ def save_seen(seen):
         json.dump(sorted(seen), file, indent=2)
 
 
+def base_roles():
+    """'associate data analyst' and 'data analyst' are searched together as 'data analyst'."""
+    roles = []
+    for role in ROLES:
+        base = re.sub(r"^associate\s+", "", role, flags=re.I).strip()
+        if base and base not in roles:
+            roles.append(base)
+    return roles
+
+
+def in_target_city(job):
+    """True if the job's location is one of the cities you asked for."""
+    location = (job.get("location") or "").lower()
+    return any(word in location for words in CITIES.values() for word in words)
+
+
 # ---------- Source 1: Adzuna ----------
 
-def fetch_adzuna_for_role(role):
-    """Ask Adzuna for jobs for ONE role and return them in our common format."""
+def fetch_adzuna(role, city):
+    """Ask Adzuna for jobs for ONE role in ONE city and return them in our common format."""
+    time.sleep(0.5)   # be gentle with Adzuna's request limit
     response = requests.get(
         "https://api.adzuna.com/v1/api/jobs/in/search/1",
         params={
             "app_id": ADZUNA_APP_ID,
             "app_key": ADZUNA_APP_KEY,
-            "results_per_page": FETCH_PER_ROLE,
+            "results_per_page": FETCH_PER_SEARCH,
             "what": role,
+            "where": city,
             "max_days_old": MAX_DAYS_OLD,
             "content-type": "application/json",
         },
@@ -70,46 +99,72 @@ def fetch_adzuna_for_role(role):
             "title": item.get("title", "No title"),
             "description": item.get("description", ""),
             "link": item.get("redirect_url", "No link"),
+            "location": item.get("location", {}).get("display_name", ""),
         })
     return jobs
 
 
 # ---------- Source 2: JSearch (through RapidAPI) ----------
 
-def fetch_jsearch_for_role(role):
-    """Ask JSearch for jobs for ONE role (uses 1 of your 200 free monthly requests)."""
-    response = requests.get(
-        "https://jsearch.p.rapidapi.com/search",
-        headers={"X-RapidAPI-Key": RAPIDAPI_KEY, "X-RapidAPI-Host": "jsearch.p.rapidapi.com"},
-        params={"query": f"{role} in India", "page": "1", "num_pages": "1", "country": "in", "date_posted": "3days"},
-        timeout=60,
-    )
-    response.raise_for_status()
+def fetch_jsearch(role, city):
+    """Ask JSearch for jobs for ONE role in ONE city (uses 1 of your 200 free monthly requests)."""
+    headers = {"X-RapidAPI-Key": RAPIDAPI_KEY, "X-RapidAPI-Host": "jsearch.p.rapidapi.com"}
+    params = {"query": f"{role} in {city}", "country": "in", "date_posted": "3days"}
+
+    # JSearch has a newer address (search-v2) and an older one (search). Try the new one first.
+    payload = None
+    for endpoint in ("search-v2", "search"):
+        response = requests.get(f"https://jsearch.p.rapidapi.com/{endpoint}",
+                                headers=headers, params=params, timeout=60)
+        if response.status_code == 404:
+            continue   # this address does not exist, try the next one
+        response.raise_for_status()
+        payload = response.json()
+        break
+    if payload is None:
+        raise RuntimeError("JSearch address not found (404) on both search-v2 and search")
+
+    items = payload.get("data", [])
+    if isinstance(items, dict):   # some versions wrap the list inside another box
+        items = items.get("jobs") or items.get("results") or []
+
     jobs = []
-    for item in response.json().get("data", []):
+    for item in items:
+        location = item.get("job_location") or ", ".join(
+            part for part in (item.get("job_city"), item.get("job_state")) if part)
         jobs.append({
             "key": "jsearch-" + str(item.get("job_id")),
             "company": item.get("employer_name") or "Unknown company",
             "title": item.get("job_title") or "No title",
             "description": item.get("job_description") or "",
             "link": item.get("job_apply_link") or item.get("job_google_link") or "No link",
+            "experience_years": item.get("required_experience_years"),
+            "location": location,
         })
     return jobs
+
+
+def todays_jsearch_searches():
+    """Pick a few role+city searches for today. They rotate daily so every city gets covered."""
+    all_searches = [(role, city) for role in base_roles() for city in CITIES]
+    start = (date.today().toordinal() * JSEARCH_REQUESTS_PER_RUN) % len(all_searches)
+    count = min(JSEARCH_REQUESTS_PER_RUN, len(all_searches))
+    return [all_searches[(start + i) % len(all_searches)] for i in range(count)]
 
 
 PROBLEMS = []   # filled in if a job source fails, and shown at the bottom of the email
 
 
-def fetch_source(fetch_function, source_name):
-    """Fetch every role from one source and mix the roles. If the source fails, return an empty list."""
+def fetch_source(fetch_function, source_name, searches):
+    """Run every role+city search for one source and mix the results. If the source fails, return an empty list."""
     try:
-        per_role = [fetch_function(role) for role in ROLES]
+        per_search = [fetch_function(role, city) for role, city in searches]
     except Exception as error:
         print(f"{source_name} failed, skipping it: {error}")
         PROBLEMS.append(f"{source_name} did not work today: {error}")
         return []
     mixed = []
-    for group in zip_longest(*per_role):   # 1st of role A, 1st of role B, 2nd of A, 2nd of B...
+    for group in zip_longest(*per_search):   # 1st of search A, 1st of search B, 2nd of A, 2nd of B...
         mixed.extend(job for job in group if job is not None)
     return mixed
 
@@ -128,7 +183,7 @@ def pick_new_jobs(adzuna_jobs, jsearch_jobs, seen):
             title_key = (job["company"].lower(), job["title"].lower())
             if job["key"] in seen or job["key"] in used_keys or title_key in used_titles:
                 continue
-            if too_experienced(job):
+            if too_experienced(job) or not in_target_city(job):
                 continue
             used_keys.add(job["key"])
             used_titles.add(title_key)
@@ -154,6 +209,9 @@ YEARS_SINGLE = re.compile(r"(\d{1,2})\s*\+?\s*(?:years?|yrs?)", re.I)
 def too_experienced(job):
     """True if the job looks senior or asks for more than MAX_EXPERIENCE_YEARS years of experience."""
     if SENIOR_TITLE.search(job["title"]):
+        return True
+    years = job.get("experience_years")   # JSearch tells us this directly for many jobs
+    if isinstance(years, (int, float)) and years > MAX_EXPERIENCE_YEARS:
         return True
     text = re.sub(r"<[^>]+>", " ", job["description"] or "")
     wanted = []
@@ -219,7 +277,7 @@ def build_email_text(jobs):
     if not jobs:
         return "No new jobs today. Everything from your search was already sent earlier."
 
-    lines = [f"{len(jobs)} new jobs today for: {', '.join(ROLES)}", ""]
+    lines = [f"{len(jobs)} new jobs today for: {', '.join(ROLES)}", f"Cities: {', '.join(CITIES)}", ""]
     hr_cache = {}  # so the same company is searched only once
     for number, job in enumerate(jobs, start=1):
         company = job["company"]
@@ -229,6 +287,7 @@ def build_email_text(jobs):
 
         lines.append(f"{number}. {company}")
         lines.append(f"Job: {job['title']}")
+        lines.append(f"Location: {job.get('location') or 'Not given'}")
         lines.append(f"About: {clean_description(job['description'])}")
         if hr:
             lines.append(f"Possible HR: {hr['name']} - {hr['link']}")
@@ -260,9 +319,10 @@ def send_email(body):
 
 if __name__ == "__main__":
     seen = load_seen()
-    adzuna_jobs = fetch_source(fetch_adzuna_for_role, "Adzuna")
+    adzuna_searches = [(role, city) for role in base_roles() for city in CITIES]
+    adzuna_jobs = fetch_source(fetch_adzuna, "Adzuna", adzuna_searches)
     if RAPIDAPI_KEY:
-        jsearch_jobs = fetch_source(fetch_jsearch_for_role, "JSearch")
+        jsearch_jobs = fetch_source(fetch_jsearch, "JSearch", todays_jsearch_searches())
     else:
         jsearch_jobs = []
         PROBLEMS.append("JSearch was skipped because the RAPIDAPI_KEY secret was not found.")
