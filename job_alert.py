@@ -13,7 +13,8 @@ SEARCH_TEXT = os.environ.get("JOB_ROLE") or DEFAULT_ROLES  # read from GitHub se
 ROLES = [role.strip() for role in SEARCH_TEXT.split(",") if role.strip()]  # separate roles with commas
 MAX_DAYS_OLD = 3           # only jobs posted in the last 3 days
 FETCH_PER_ROLE = 50        # how many jobs to ask Adzuna for, for each role
-JOBS_PER_DAY = 15          # how many NEW jobs to email each day (each one uses up to 1 Serper search)
+JOBS_PER_DAY = 15          # how many NEW jobs to email each day
+ADZUNA_SHARE = 0.5         # half of the jobs from Adzuna, the other half from JSearch
 DESCRIPTION_LENGTH = 350   # how many characters of the job description to show
 SEEN_FILE = "seen_companies.json"   # remembers jobs already sent (just a file name), so they don't repeat
 
@@ -23,6 +24,7 @@ ADZUNA_APP_KEY = os.environ["ADZUNA_APP_KEY"]
 GMAIL_ADDRESS = os.environ["GMAIL_ADDRESS"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"].replace(" ", "")
 SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")
+RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY", "")
 
 HR_WORDS = ["hr", "human resources", "recruit", "talent", "hiring", "people"]
 COMPANY_SUFFIXES = ["private limited", "pvt ltd", "pvt. ltd.", "limited", "ltd", "llp", "inc", "india", "technologies", "solutions"]
@@ -42,49 +44,99 @@ def save_seen(seen):
         json.dump(sorted(seen), file, indent=2)
 
 
-def job_key(job):
-    """A unique ID for a job, used to remember it."""
-    return str(job.get("id") or job.get("redirect_url"))
+# ---------- Source 1: Adzuna ----------
 
-
-def fetch_jobs_for_role(role):
-    """Ask Adzuna for jobs for ONE role and return them as a list."""
-    url = "https://api.adzuna.com/v1/api/jobs/in/search/1"
-    params = {
-        "app_id": ADZUNA_APP_ID,
-        "app_key": ADZUNA_APP_KEY,
-        "results_per_page": FETCH_PER_ROLE,
-        "what": role,
-        "max_days_old": MAX_DAYS_OLD,
-        "content-type": "application/json",
-    }
-    response = requests.get(url, params=params, timeout=30)
+def fetch_adzuna_for_role(role):
+    """Ask Adzuna for jobs for ONE role and return them in our common format."""
+    response = requests.get(
+        "https://api.adzuna.com/v1/api/jobs/in/search/1",
+        params={
+            "app_id": ADZUNA_APP_ID,
+            "app_key": ADZUNA_APP_KEY,
+            "results_per_page": FETCH_PER_ROLE,
+            "what": role,
+            "max_days_old": MAX_DAYS_OLD,
+            "content-type": "application/json",
+        },
+        timeout=30,
+    )
     response.raise_for_status()
-    return response.json().get("results", [])
+    jobs = []
+    for item in response.json().get("results", []):
+        jobs.append({
+            "key": "adzuna-" + str(item.get("id") or item.get("redirect_url")),
+            "company": item.get("company", {}).get("display_name", "Unknown company"),
+            "title": item.get("title", "No title"),
+            "description": item.get("description", ""),
+            "link": item.get("redirect_url", "No link"),
+        })
+    return jobs
 
 
-def fetch_jobs():
-    """Search every role and mix the results (one job of each role in turn), removing duplicates."""
-    results_per_role = [fetch_jobs_for_role(role) for role in ROLES]
-    all_jobs = []
-    seen_keys = set()
-    for group in zip_longest(*results_per_role):   # takes 1st of role A, 1st of role B, 2nd of A, 2nd of B...
-        for job in group:
-            if job is None:
+# ---------- Source 2: JSearch (through RapidAPI) ----------
+
+def fetch_jsearch_for_role(role):
+    """Ask JSearch for jobs for ONE role (uses 1 of your 200 free monthly requests)."""
+    response = requests.get(
+        "https://jsearch.p.rapidapi.com/search",
+        headers={"X-RapidAPI-Key": RAPIDAPI_KEY, "X-RapidAPI-Host": "jsearch.p.rapidapi.com"},
+        params={"query": f"{role} in India", "page": "1", "num_pages": "1", "country": "in", "date_posted": "3days"},
+        timeout=60,
+    )
+    response.raise_for_status()
+    jobs = []
+    for item in response.json().get("data", []):
+        jobs.append({
+            "key": "jsearch-" + str(item.get("job_id")),
+            "company": item.get("employer_name") or "Unknown company",
+            "title": item.get("job_title") or "No title",
+            "description": item.get("job_description") or "",
+            "link": item.get("job_apply_link") or item.get("job_google_link") or "No link",
+        })
+    return jobs
+
+
+def fetch_source(fetch_function, source_name):
+    """Fetch every role from one source and mix the roles. If the source fails, return an empty list."""
+    try:
+        per_role = [fetch_function(role) for role in ROLES]
+    except Exception as error:
+        print(f"{source_name} failed, skipping it: {error}")
+        return []
+    mixed = []
+    for group in zip_longest(*per_role):   # 1st of role A, 1st of role B, 2nd of A, 2nd of B...
+        mixed.extend(job for job in group if job is not None)
+    return mixed
+
+
+def pick_new_jobs(adzuna_jobs, jsearch_jobs, seen):
+    """Pick about half from each source, skipping jobs already sent and duplicates between the sources."""
+    chosen = []
+    used_keys = set()
+    used_titles = set()
+
+    def take(jobs, how_many):
+        taken = 0
+        for job in jobs:
+            if taken >= how_many:
+                break
+            title_key = (job["company"].lower(), job["title"].lower())
+            if job["key"] in seen or job["key"] in used_keys or title_key in used_titles:
                 continue
-            key = job_key(job)
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
-            all_jobs.append(job)
-    return all_jobs
+            used_keys.add(job["key"])
+            used_titles.add(title_key)
+            chosen.append(job)
+            taken += 1
+
+    adzuna_target = round(JOBS_PER_DAY * ADZUNA_SHARE)
+    take(adzuna_jobs, adzuna_target)
+    take(jsearch_jobs, JOBS_PER_DAY - len(chosen))
+    # if JSearch had fewer jobs than its half, fill the rest from Adzuna
+    take(adzuna_jobs, JOBS_PER_DAY - len(chosen))
+    return chosen
 
 
-def pick_new_jobs(jobs, seen):
-    """Keep only jobs we have not sent before, up to JOBS_PER_DAY."""
-    new_jobs = [job for job in jobs if job_key(job) not in seen]
-    return new_jobs[:JOBS_PER_DAY]
-
+# ---------- HR search ----------
 
 def short_company_name(company):
     """Cut a company name down to its main part, e.g. 'Infosys Limited' -> 'infosys'."""
@@ -122,6 +174,8 @@ def find_hr_contact(company):
     return None
 
 
+# ---------- Email ----------
+
 def clean_description(text):
     """Make the job description short and tidy."""
     text = re.sub(r"<[^>]+>", " ", text or "")
@@ -139,19 +193,19 @@ def build_email_text(jobs):
     lines = [f"{len(jobs)} new jobs today for: {', '.join(ROLES)}", ""]
     hr_cache = {}  # so the same company is searched only once
     for number, job in enumerate(jobs, start=1):
-        company = job.get("company", {}).get("display_name", "Unknown company")
+        company = job["company"]
         if company not in hr_cache:
             hr_cache[company] = find_hr_contact(company)
         hr = hr_cache[company]
 
         lines.append(f"{number}. {company}")
-        lines.append(f"Job: {job.get('title', 'No title')}")
-        lines.append(f"About: {clean_description(job.get('description'))}")
+        lines.append(f"Job: {job['title']}")
+        lines.append(f"About: {clean_description(job['description'])}")
         if hr:
             lines.append(f"Possible HR: {hr['name']} - {hr['link']}")
         else:
             lines.append("Possible HR: not found")
-        lines.append(f"Apply: {job.get('redirect_url', 'No link')}")
+        lines.append(f"Apply: {job['link']}")
         lines.append("")
         lines.append("-----")
         lines.append("")
@@ -175,12 +229,13 @@ def send_email(body):
 
 if __name__ == "__main__":
     seen = load_seen()
-    jobs = fetch_jobs()
-    new_jobs = pick_new_jobs(jobs, seen)
+    adzuna_jobs = fetch_source(fetch_adzuna_for_role, "Adzuna")
+    jsearch_jobs = fetch_source(fetch_jsearch_for_role, "JSearch") if RAPIDAPI_KEY else []
+    new_jobs = pick_new_jobs(adzuna_jobs, jsearch_jobs, seen)
     email_text = build_email_text(new_jobs)
     send_email(email_text)
 
     # Only after the email is sent, remember these jobs so they don't repeat
-    seen.update(job_key(job) for job in new_jobs)
+    seen.update(job["key"] for job in new_jobs)
     save_seen(seen)
     print(f"Email sent with {len(new_jobs)} new jobs.")
