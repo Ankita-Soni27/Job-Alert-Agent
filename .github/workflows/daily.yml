@@ -30,6 +30,7 @@ jobs:
           GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
+          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
           JOB_ROLE: ${{ vars.JOB_ROLE }}
         run: python job_alert.py
 
