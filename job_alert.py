@@ -8,10 +8,11 @@ from itertools import zip_longest
 import requests
 
 # --- Your settings (change these anytime) ---
-DEFAULT_ROLES = "business analyst fresher, data analyst fresher"
+DEFAULT_ROLES = "associate data analyst, associate business analyst, data analyst, business analyst"
 SEARCH_TEXT = os.environ.get("JOB_ROLE") or DEFAULT_ROLES  # read from GitHub setting JOB_ROLE
 ROLES = [role.strip() for role in SEARCH_TEXT.split(",") if role.strip()]  # separate roles with commas
 MAX_DAYS_OLD = 3           # only jobs posted in the last 3 days
+MAX_EXPERIENCE_YEARS = 3   # skip jobs that ask for more than this many years of experience
 FETCH_PER_ROLE = 50        # how many jobs to ask Adzuna for, for each role
 JOBS_PER_DAY = 15          # how many NEW jobs to email each day
 ADZUNA_SHARE = 0.5         # half of the jobs from Adzuna, the other half from JSearch
@@ -96,12 +97,16 @@ def fetch_jsearch_for_role(role):
     return jobs
 
 
+PROBLEMS = []   # filled in if a job source fails, and shown at the bottom of the email
+
+
 def fetch_source(fetch_function, source_name):
     """Fetch every role from one source and mix the roles. If the source fails, return an empty list."""
     try:
         per_role = [fetch_function(role) for role in ROLES]
     except Exception as error:
         print(f"{source_name} failed, skipping it: {error}")
+        PROBLEMS.append(f"{source_name} did not work today: {error}")
         return []
     mixed = []
     for group in zip_longest(*per_role):   # 1st of role A, 1st of role B, 2nd of A, 2nd of B...
@@ -123,6 +128,8 @@ def pick_new_jobs(adzuna_jobs, jsearch_jobs, seen):
             title_key = (job["company"].lower(), job["title"].lower())
             if job["key"] in seen or job["key"] in used_keys or title_key in used_titles:
                 continue
+            if too_experienced(job):
+                continue
             used_keys.add(job["key"])
             used_titles.add(title_key)
             chosen.append(job)
@@ -134,6 +141,28 @@ def pick_new_jobs(adzuna_jobs, jsearch_jobs, seen):
     # if JSearch had fewer jobs than its half, fill the rest from Adzuna
     take(adzuna_jobs, JOBS_PER_DAY - len(chosen))
     return chosen
+
+
+# ---------- Experience filter (keeps 0-3 years jobs) ----------
+
+SENIOR_TITLE = re.compile(
+    r"\b(senior|sr|lead|manager|head|principal|director|architect|vp|staff|chief)\b|\bl[3-9]\b", re.I)
+YEARS_RANGE = re.compile(r"(\d{1,2})\s*(?:-|to|\u2013)\s*(\d{1,2})\s*\+?\s*(?:years?|yrs?)", re.I)
+YEARS_SINGLE = re.compile(r"(\d{1,2})\s*\+?\s*(?:years?|yrs?)", re.I)
+
+
+def too_experienced(job):
+    """True if the job looks senior or asks for more than MAX_EXPERIENCE_YEARS years of experience."""
+    if SENIOR_TITLE.search(job["title"]):
+        return True
+    text = re.sub(r"<[^>]+>", " ", job["description"] or "")
+    wanted = []
+    for pattern in (YEARS_RANGE, YEARS_SINGLE):
+        for match in pattern.finditer(text):
+            around = text[max(0, match.start() - 40): match.end() + 40].lower()
+            if "experience" in around or "exp" in around:
+                wanted.append(int(match.group(1)))   # the lower number, e.g. 3 in "3-5 years"
+    return bool(wanted) and min(wanted) > MAX_EXPERIENCE_YEARS
 
 
 # ---------- HR search ----------
@@ -211,6 +240,8 @@ def build_email_text(jobs):
         lines.append("")
     lines.append("Note: HR contacts come from a Google search and may be wrong. "
                  "Check the profile before messaging anyone.")
+    for problem in PROBLEMS:
+        lines.append(f"Problem: {problem}")
     return "\n".join(lines)
 
 
@@ -230,7 +261,11 @@ def send_email(body):
 if __name__ == "__main__":
     seen = load_seen()
     adzuna_jobs = fetch_source(fetch_adzuna_for_role, "Adzuna")
-    jsearch_jobs = fetch_source(fetch_jsearch_for_role, "JSearch") if RAPIDAPI_KEY else []
+    if RAPIDAPI_KEY:
+        jsearch_jobs = fetch_source(fetch_jsearch_for_role, "JSearch")
+    else:
+        jsearch_jobs = []
+        PROBLEMS.append("JSearch was skipped because the RAPIDAPI_KEY secret was not found.")
     new_jobs = pick_new_jobs(adzuna_jobs, jsearch_jobs, seen)
     email_text = build_email_text(new_jobs)
     send_email(email_text)
