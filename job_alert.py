@@ -1,3 +1,4 @@
+import html
 import json
 import os
 import re
@@ -194,7 +195,10 @@ def pick_new_jobs(adzuna_jobs, jsearch_jobs, seen):
             title_key = (job["company"].lower(), job["title"].lower())
             if job["key"] in seen or job["key"] in used_keys or title_key in used_titles:
                 continue
-            if too_experienced(job) or not in_target_city(job):
+            if too_experienced(job):
+                print(f"Skipped (too experienced): {job['company']} - {job['title']}")
+                continue
+            if not in_target_city(job):
                 continue
             used_keys.add(job["key"])
             used_titles.add(title_key)
@@ -213,25 +217,42 @@ def pick_new_jobs(adzuna_jobs, jsearch_jobs, seen):
 
 SENIOR_TITLE = re.compile(
     r"\b(senior|sr|lead|manager|head|principal|director|architect|vp|staff|chief)\b|\bl[3-9]\b", re.I)
-YEARS_RANGE = re.compile(r"(\d{1,2})\s*(?:-|to|\u2013)\s*(\d{1,2})\s*\+?\s*(?:years?|yrs?)", re.I)
+YEARS_RANGE = re.compile(r"(\d{1,2})\s*(?:-|to|\u2013|\u2014)\s*(\d{1,2})\s*\+?\s*(?:years?|yrs?)", re.I)
 YEARS_SINGLE = re.compile(r"(\d{1,2})\s*\+?\s*(?:years?|yrs?)", re.I)
+EXPERIENCE_LABEL = re.compile(r"(?:experience|exp)\s*(?:required)?\s*[:\-]\s*(\d{1,2})\b", re.I)
+
+
+def tidy_text(text):
+    """Remove HTML tags, odd spaces and symbols so the experience can be read reliably."""
+    text = html.unescape(text or "")
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", text)
+    return " ".join(text.replace("\xa0", " ").split())
+
+
+def minimum_experience(job):
+    """Return the smallest number of years the job asks for, or None if it does not say."""
+    years = job.get("experience_years")   # JSearch tells us this directly for many jobs
+    if isinstance(years, (int, float)):
+        return years
+    text = tidy_text(job.get("description"))
+    found = []
+    for pattern in (YEARS_RANGE, YEARS_SINGLE):
+        for match in pattern.finditer(text):
+            around = text[max(0, match.start() - 40): match.end() + 40].lower()
+            if "experience" in around or "exp" in around:
+                found.append(int(match.group(1)))   # the lower number, e.g. 3 in "3-5 years"
+    for match in EXPERIENCE_LABEL.finditer(text):   # e.g. "Experience: 7"
+        found.append(int(match.group(1)))
+    return min(found) if found else None
 
 
 def too_experienced(job):
     """True if the job looks senior or asks for more than MAX_EXPERIENCE_YEARS years of experience."""
     if SENIOR_TITLE.search(job["title"]):
         return True
-    years = job.get("experience_years")   # JSearch tells us this directly for many jobs
-    if isinstance(years, (int, float)) and years > MAX_EXPERIENCE_YEARS:
-        return True
-    text = re.sub(r"<[^>]+>", " ", job["description"] or "")
-    wanted = []
-    for pattern in (YEARS_RANGE, YEARS_SINGLE):
-        for match in pattern.finditer(text):
-            around = text[max(0, match.start() - 40): match.end() + 40].lower()
-            if "experience" in around or "exp" in around:
-                wanted.append(int(match.group(1)))   # the lower number, e.g. 3 in "3-5 years"
-    return bool(wanted) and min(wanted) > MAX_EXPERIENCE_YEARS
+    years = minimum_experience(job)
+    return years is not None and years > MAX_EXPERIENCE_YEARS
 
 
 # ---------- HR search ----------
@@ -299,6 +320,8 @@ def build_email_text(jobs):
         lines.append(f"{number}. {company}")
         lines.append(f"Job: {job['title']}")
         lines.append(f"Location: {job.get('location') or 'Not given'}")
+        years = minimum_experience(job)
+        lines.append("Experience asked: " + ("not mentioned" if years is None else f"{years}+ years"))
         lines.append(f"About: {clean_description(job['description'])}")
         if hr:
             lines.append(f"Possible HR: {hr['name']} - {hr['link']}")
