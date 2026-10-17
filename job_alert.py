@@ -111,18 +111,24 @@ def fetch_jsearch(role, city):
     headers = {"X-RapidAPI-Key": RAPIDAPI_KEY, "X-RapidAPI-Host": "jsearch.p.rapidapi.com"}
     params = {"query": f"{role} in {city}", "country": "in", "date_posted": "3days"}
 
-    # JSearch has a newer address (search-v2) and an older one (search). Try the new one first.
+    # JSearch has a newer address (search-v2) and an older one (search).
+    # Try the new one first; if it is missing (404) or too slow, try the other one.
     payload = None
-    for endpoint in ("search-v2", "search"):
-        response = requests.get(f"https://jsearch.p.rapidapi.com/{endpoint}",
-                                headers=headers, params=params, timeout=60)
-        if response.status_code == 404:
-            continue   # this address does not exist, try the next one
-        response.raise_for_status()
-        payload = response.json()
-        break
+    last_error = None
+    for endpoint, wait_seconds in (("search-v2", 90), ("search", 60)):
+        try:
+            response = requests.get(f"https://jsearch.p.rapidapi.com/{endpoint}",
+                                    headers=headers, params=params, timeout=wait_seconds)
+            if response.status_code == 404:
+                last_error = f"{endpoint} not found (404)"
+                continue
+            response.raise_for_status()
+            payload = response.json()
+            break
+        except requests.exceptions.RequestException as error:
+            last_error = f"{endpoint}: {error}"
     if payload is None:
-        raise RuntimeError("JSearch address not found (404) on both search-v2 and search")
+        raise RuntimeError(last_error or "JSearch gave no answer")
 
     items = payload.get("data", [])
     if isinstance(items, dict):   # some versions wrap the list inside another box
@@ -156,13 +162,18 @@ PROBLEMS = []   # filled in if a job source fails, and shown at the bottom of th
 
 
 def fetch_source(fetch_function, source_name, searches):
-    """Run every role+city search for one source and mix the results. If the source fails, return an empty list."""
-    try:
-        per_search = [fetch_function(role, city) for role, city in searches]
-    except Exception as error:
-        print(f"{source_name} failed, skipping it: {error}")
-        PROBLEMS.append(f"{source_name} did not work today: {error}")
-        return []
+    """Run every role+city search for one source and mix the results.
+    If one search fails, the others still count. The email tells you what went wrong."""
+    per_search = []
+    errors = []
+    for role, city in searches:
+        try:
+            per_search.append(fetch_function(role, city))
+        except Exception as error:
+            print(f"{source_name} search failed for {role} in {city}: {error}")
+            errors.append(str(error))
+    if errors:
+        PROBLEMS.append(f"{source_name}: {len(errors)} of {len(searches)} searches failed. First error: {errors[0]}")
     mixed = []
     for group in zip_longest(*per_search):   # 1st of search A, 1st of search B, 2nd of A, 2nd of B...
         mixed.extend(job for job in group if job is not None)
